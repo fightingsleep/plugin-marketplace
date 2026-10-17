@@ -1,0 +1,18 @@
+{
+  "name": "boox",
+  "version": "1.0.0",
+  "description": "Send files to a BOOX e-ink tablet over the internet, read handwriting from its notebooks, write back in ink, and set its sleep screen",
+  "author": {
+    "name": "fightingsleep"
+  },
+  "license": "MIT",
+  "keywords": [
+    "boox",
+    "e-ink",
+    "send2boox",
+    "onyx",
+    "handwriting"
+  ],
+  "homepage": "https://github.com/fightingsleep/plugin-marketplace",
+  "repository": "https://github.com/fightingsleep/plugin-marketplace"
+}

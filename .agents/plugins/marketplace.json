@@ -1,0 +1,20 @@
+{
+  "name": "fightingsleep-plugins",
+  "interface": {
+    "displayName": "fightingsleep plugins"
+  },
+  "plugins": [
+    {
+      "name": "boox",
+      "source": {
+        "source": "local",
+        "path": "./plugins/boox"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

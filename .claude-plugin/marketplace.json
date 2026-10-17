@@ -1,0 +1,16 @@
+{
+  "name": "fightingsleep-plugins",
+  "owner": {
+    "name": "fightingsleep"
+  },
+  "metadata": {
+    "description": "Plugins for Claude Code and Codex"
+  },
+  "plugins": [
+    {
+      "name": "boox",
+      "source": "./plugins/boox",
+      "description": "Send files to a BOOX e-ink tablet over the internet, read handwriting from its notebooks, write back in ink, and set its sleep screen"
+    }
+  ]
+}
