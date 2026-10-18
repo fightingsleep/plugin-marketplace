@@ -7,7 +7,7 @@ description: Work with the user's BOOX (Onyx) e-ink tablet over the internet via
 
 Transfers files to the user's BOOX tablet through the Send2Boox cloud. It works from anywhere, and the tablet doesn't need to be on the same network. Files download automatically to the tablet within a few seconds while it's online.
 
-The CLI is `scripts/send2boox.py` in this skill's directory. Run it with `uv run --script <skill-dir>/scripts/send2boox.py ...`. uv installs its dependencies automatically.
+The CLI is `scripts/send2boox.py` in this skill's directory. Run it with `uv run --script <skill-dir>/scripts/send2boox.py ...` on Windows, macOS and Linux, in Bash or PowerShell; quote the path if it has spaces. uv installs its dependencies automatically, and nothing else needs installing. If a conversion fails or falls back, `send2boox.py doctor` shows which renderers this machine has.
 
 ## Sending files: send them unchanged
 
@@ -19,15 +19,16 @@ The user is transferring their file, so don't convert, rename or modify it unles
 
 ## Sending content you wrote
 
-When there's no file (a summary, notes or a report you generated), use `send-text`. It turns Markdown into a clean, e-ink-friendly PDF by default:
+When there's no file (a summary, notes or a report you generated), use `send-text`. It turns Markdown into a clean, e-ink-friendly PDF by default. Write the Markdown to a temporary file, then send it:
 
-`printf '%s' "$CONTENT" | send2boox.py send-text --title "Reading notes"`
+`send2boox.py send-text --file notes.md --title "Reading notes"`
 
-- Write the content as Markdown. Headings, lists, tables and code blocks all render well.
+- `--file` works the same in every shell. Prefer it on Windows: PowerShell can garble non-ASCII text that's piped in. In Bash you can also pipe: `printf '%s' "$CONTENT" | send2boox.py send-text --title "Reading notes"`.
+- Write the content as Markdown. Headings, lists, tables, code blocks, footnotes and math all render well. Images must be local files next to the Markdown file; remote images are replaced by their alt text.
 - Use `--as epub` for long prose meant to be read like a book, since EPUB text reflows and can be resized.
 - Always give a short, descriptive `--title`, because that's the name the user sees on the tablet.
 
-Format ranking for a stylus tablet such as the Note Max (13.3", 3:4): **PDF** (best: near print-size pages that the user can annotate) > **EPUB** (long reflowable reading) > **TXT** (fallback only). The script falls back down this list automatically if a conversion fails, for example when no CJK font is available to render a PDF.
+Format ranking for a stylus tablet such as the Note Max (13.3", 3:4): **PDF** (best: near print-size pages that the user can annotate) > **EPUB** (long reflowable reading) > **TXT** (fallback only). The script falls back down this list automatically if a conversion fails, for example when no CJK font is installed to render a PDF. The last line of output says what was sent: `Sent: Notes.pdf`, or `Sent as EPUB (PDF unavailable: <reason>): Notes.epub`. When it falls back, tell the user what was sent and why.
 
 ## Reading the user's handwriting
 
@@ -70,4 +71,4 @@ The token is stored in `~/.config/send2boox/config.json` (readable only by the u
 - This uses an unofficial, reverse-engineered BOOX API. The script already retries when the BOOX server is slow. If a command still fails, report the exact error instead of retrying in a loop.
 - Sending can take up to a minute while BOOX processes the file.
 - Only send what the user asked for. Everything sent is uploaded to BOOX's cloud.
-- HTML is rendered offline, with access only to files in its own folder and no file attachments. Still, don't render HTML from untrusted sources, and don't render HTML that sits directly in the home directory.
+- HTML with its own CSS (`send page.html --as pdf`, HTML sleep screens) is rendered by an installed Chrome, Edge or Chromium (Edge comes with Windows), or by WeasyPrint where its libraries exist. It's rendered offline and without scripts, and can only load non-hidden files from its own folder. Still, don't render HTML from untrusted sources. The script refuses HTML that sits directly in the home folder or a drive root.

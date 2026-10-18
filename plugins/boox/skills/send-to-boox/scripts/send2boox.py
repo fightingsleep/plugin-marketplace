@@ -1,7 +1,17 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["requests>=2.31", "oss2>=2.18", "pypandoc_binary>=1.13", "weasyprint>=62", "pypdfium2>=4", "pillow>=10", "Hershey-Fonts>=2"]
+# dependencies = [
+#   "requests>=2.31",
+#   "alibabacloud-oss-v2>=1.4",
+#   "pypandoc_binary>=1.13; sys_platform != 'win32' or platform_machine != 'ARM64'",
+#   "pypandoc>=1.13; sys_platform == 'win32' and platform_machine == 'ARM64'",
+#   "typst>=0.15; sys_platform != 'win32' or platform_machine != 'ARM64'",
+#   "weasyprint>=62; sys_platform != 'win32'",
+#   "pypdfium2>=4",
+#   "pillow>=10",
+#   "Hershey-Fonts>=2",
+# ]
 # ///
 """Send files to a BOOX e-ink tablet through the Send2Boox cloud service.
 
@@ -15,16 +25,23 @@ BOOX Note Max (13.3" 3:4 e-ink, stylus annotation in NeoReader):
   2. EPUB - reflowable; better for long prose (books, long articles).
   3. TXT  - fallback only, if PDF/EPUB conversion fails.
 
+Rendering works on Windows, macOS and Linux with nothing to install but uv: documents go
+through pandoc and Typst (both bundled). HTML with its own CSS (designed pages, sleep
+screens) needs an HTML engine: an installed Chrome, Edge or Chromium, or WeasyPrint where
+its Pango libraries exist. `send2boox.py doctor` shows what's available.
+
 Config: ~/.config/send2boox/config.json (mode 600), or BOOX_TOKEN / BOOX_CLOUD env vars.
 """
 import argparse
+import io
 import json
 import os
+import re
+import shutil
 import sys
 import tempfile
-import io
 import uuid
-from functools import cached_property
+from functools import cache, cached_property
 from html import escape
 from pathlib import Path
 
@@ -39,6 +56,36 @@ NATIVE = {".pdf", ".epub", ".djvu", ".cbz", ".cbr", ".mobi", ".azw3", ".fb2",
 # Converted (pandoc input format by extension).
 CONVERTIBLE = {".md": "markdown", ".markdown": "markdown", ".txt": "markdown", ".html": "html",
                ".htm": "html", ".docx": "docx", ".odt": "odt", ".rst": "rst", ".org": "org", ".tex": "latex"}
+
+# The same look as EINK_CSS, for Typst: pure black on white, a 3:4 page, print-size type.
+# Body and code use fonts embedded in Typst, so documents look the same on every OS;
+# headings use a common system sans. Typst falls back to any installed font for missing glyphs.
+TYPST_PREAMBLE = """
+#set page(width: 210mm, height: 280mm, margin: (top: 14mm, x: 15mm, bottom: 16mm),
+  footer: context align(center, text(9pt, counter(page).display("1 / 1", both: true))))
+#set text(font: "Libertinus Serif", size: 13pt, fill: black)
+#set par(leading: 0.8em, spacing: 1.2em)
+#show heading: set text(font: ("DejaVu Sans", "Noto Sans", "Segoe UI", "Helvetica Neue", "Arial"), weight: "bold")
+#show heading: set block(above: 1.4em, below: 0.7em)
+#show heading.where(level: 1): set text(22pt)
+#show heading.where(level: 2): set text(16pt)
+#show heading.where(level: 2): it => block(width: 100%, stroke: (bottom: 1.5pt), inset: (bottom: 3pt), it)
+#show heading.where(level: 3): set text(13pt)
+#show heading.where(level: 4): set text(12pt)
+#show link: underline
+#show raw: set text(font: "DejaVu Sans Mono", size: 10pt)
+#show raw.where(block: true): it => block(width: 100%, stroke: 1pt, inset: (x: 8pt, y: 6pt), it)
+#show quote.where(block: true): it => block(stroke: (left: 3pt), inset: (left: 10pt, y: 2pt),
+  text(style: "italic", it.body))
+#show table: set align(left)
+#set table(stroke: 1pt, inset: (x: 6pt, y: 4pt))
+#set table.hline(stroke: 2pt)
+#show table.cell.where(y: 0): set text(weight: "bold")
+#show figure: set block(breakable: true)
+#set figure(numbering: none)
+#show figure.caption: set text(10pt)
+#let horizontalrule = block(above: 1em, below: 1em, line(length: 100%, stroke: 1pt))
+"""
 
 # Tuned for e-ink: pure black on white (grey fills dither), 3:4 page matching the
 # Note Max's 2400x3200 screen so pages display without letterboxing, print-size type.
@@ -63,7 +110,7 @@ img { max-width: 100%; }
 
 
 def load_config() -> dict:
-    cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
     if os.environ.get("BOOX_TOKEN"):
         cfg["token"] = os.environ["BOOX_TOKEN"]
     if os.environ.get("BOOX_CLOUD"):
@@ -82,8 +129,9 @@ def save_config(cfg: dict) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(CONFIG_PATH.parent, 0o700)
     fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(fd, 0o600)  # O_CREAT's mode doesn't apply to an existing file
-    with os.fdopen(fd, "w") as f:
+    if hasattr(os, "fchmod"):  # missing on Windows before Python 3.13, where the profile's ACLs protect it
+        os.fchmod(fd, 0o600)  # O_CREAT's mode doesn't apply to an existing file
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
 
@@ -118,9 +166,21 @@ def ts(d: dict) -> float:
 
 def no_attachments(html: str) -> str:
     """Drop rel=attachment so WeasyPrint can't embed files into an uploaded PDF."""
-    import re
-
     return re.sub(r"""\brel\s*=\s*(["']?)[^"'>]*\battachment\b[^"'>]*\1""", "", html, flags=re.I)
+
+
+def resource_root(base: Path) -> Path:
+    """The folder an HTML page may load images and fonts from: its own, but never a home or drive root."""
+    root = base.resolve()
+    if root == Path.home().resolve() or root == Path(root.anchor):
+        raise RenderError(f"won't render HTML whose folder is {root}; move it into its own folder")
+    return root
+
+
+def allowed_file(root: Path, path: Path) -> bool:
+    """True for a regular file under root that isn't hidden (no dotfile or dot-folder like .ssh)."""
+    p = path.resolve()
+    return p.is_relative_to(root) and p.is_file() and not any(s.startswith(".") for s in p.relative_to(root).parts)
 
 
 def local_fetcher(base: Path):
@@ -129,13 +189,14 @@ def local_fetcher(base: Path):
     Rendered pages are uploaded to the cloud, so HTML must not be able to pull in
     (or attach) arbitrary local files such as ~/.ssh keys.
     """
-    from urllib.parse import unquote, urlparse
+    from urllib.parse import urlparse
+    from urllib.request import url2pathname
 
-    root = base.resolve()
+    root = resource_root(base)
 
     def check(url):
         u = urlparse(url)
-        if not (u.scheme == "data" or (u.scheme == "file" and Path(unquote(u.path)).resolve().is_relative_to(root))):
+        if not (u.scheme == "data" or (u.scheme == "file" and allowed_file(root, Path(url2pathname(u.path))))):
             raise ValueError(f"blocked resource: {url}")
 
     try:  # WeasyPrint 68+
@@ -167,18 +228,8 @@ class Boox:
         return self.call("users/me")["data"]["uid"]
 
     @cached_property
-    def bucket(self):
-        import warnings
-        warnings.filterwarnings("ignore", category=SyntaxWarning)  # oss2 docstrings on Python 3.12+
-        import oss2
-
-        cfg = self.call("config/buckets")["data"]["onyx-cloud"]
-        sts = self.call("config/stss")["data"]
-        auth = oss2.StsAuth(sts["AccessKeyId"], sts["AccessKeySecret"], sts["SecurityToken"])
-        endpoint = cfg["aliEndpoint"]
-        if "://" not in endpoint:
-            endpoint = "https://" + endpoint  # oss2 defaults to plain http
-        return oss2.Bucket(auth, endpoint.replace("http://", "https://", 1), cfg["bucket"])
+    def storage(self) -> "Storage":
+        return Storage(self.call("config/buckets")["data"]["onyx-cloud"], self.call("config/stss")["data"])
 
     def call(self, path: str, data: dict | None = None, params: dict | None = None, timeout: int = 30) -> dict:
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
@@ -200,16 +251,14 @@ class Boox:
         return body
 
     def send_file(self, path: Path, title: str | None = None) -> str:
-        import oss2
-
         key = f"{self.uid}/push/{uuid.uuid4()}{path.suffix}"
-        oss2.resumable_upload(self.bucket, key, str(path))
+        self.storage.upload(key, path)
         name = title or path.name
         if not Path(name).suffix:
             name += path.suffix
         # saveAndPush is slow (often 30s+) because the server processes the file before replying.
         saved = self.call("push/saveAndPush", timeout=180, data={"data": {
-            "bucket": self.bucket.bucket_name,
+            "bucket": self.storage.bucket,
             "name": name,
             "parent": None,
             "resourceDisplayName": name,
@@ -279,6 +328,43 @@ class Boox:
             sys.exit(f"error: re-push failed: HTTP {r.status_code} {r.text[:200]}")
 
 
+class Storage:
+    """BOOX's Aliyun OSS bucket, accessed with the account's temporary (STS) credentials."""
+
+    def __init__(self, cfg: dict, sts: dict):
+        import alibabacloud_oss_v2 as oss
+
+        host = cfg["aliEndpoint"].split("://")[-1].strip("/")  # e.g. oss-us-west-1.aliyuncs.com
+        c = oss.config.load_default()
+        c.credentials_provider = oss.credentials.StaticCredentialsProvider(
+            sts["AccessKeyId"], sts["AccessKeySecret"], sts["SecurityToken"])
+        c.endpoint = host
+        c.region = (cfg.get("region") or host.split(".")[0]).removeprefix("oss-")
+        self.oss, self.client, self.bucket = oss, oss.Client(c), cfg["bucket"]
+
+    def upload(self, key: str, path: Path) -> None:
+        # Large files go up in parts; no checkpoint files are left behind.
+        self.client.uploader().upload_file(self.oss.PutObjectRequest(bucket=self.bucket, key=key), filepath=str(path))
+
+    def put(self, key: str, data: bytes) -> None:
+        self.client.put_object(self.oss.PutObjectRequest(bucket=self.bucket, key=key, body=data))
+
+    def get(self, key: str) -> bytes:
+        return self.client.get_object(self.oss.GetObjectRequest(bucket=self.bucket, key=key)).body.read()
+
+    def list(self, prefix: str) -> list:
+        """Objects (with .key and .last_modified) under a prefix."""
+        pages = self.client.list_objects_v2_paginator().iter_page(
+            self.oss.ListObjectsV2Request(bucket=self.bucket, prefix=prefix))
+        return [o for page in pages for o in page.contents or []]
+
+    def sign_url(self, key: str, seconds: int) -> str:
+        from datetime import timedelta
+
+        req = self.oss.GetObjectRequest(bucket=self.bucket, key=key, response_content_disposition="attachment")
+        return self.client.presign(req, expires=timedelta(seconds=seconds)).url
+
+
 def client(require_token: bool = True) -> Boox:
     cfg = load_config()
     if require_token and not cfg.get("token"):
@@ -313,69 +399,381 @@ def cmd_status(a):
     print(f"Logged in as {me.get('nickname') or me.get('email') or me.get('uid')} on {load_config()['cloud']}")
 
 
-def needs_missing_cjk_font(text: str) -> bool:
-    """True if the text has CJK characters and fontconfig has no font for them.
+class RenderError(Exception):
+    """A renderer couldn't produce a file. The message is a short, one-line reason."""
 
-    The tablet renders EPUB with its own fonts, so CJK falls back to EPUB rather than
-    printing boxes into a PDF.
+
+def reason(e: Exception) -> str:
+    """One line from an exception, for warnings and the final "Sent as" line."""
+    msg = (getattr(e, "message", None) or str(e)).strip()
+    return (msg.splitlines()[0] if msg else type(e).__name__)[:200]
+
+
+CJK_TEXT = re.compile(r"[぀-ヿ㐀-鿿가-힯豈-﫿]")
+# Font families that cover CJK, across Windows, macOS and Linux.
+CJK_FONTS = re.compile(
+    r"CJK|Source Han|WenQuanYi|Droid Sans Fallback|AR PL|YaHei|JhengHei|SimSun|SimHei|MingLiU|KaiTi|FangSong|"
+    r"Yu Gothic|Yu Mincho|MS Gothic|MS Mincho|Meiryo|Malgun|Gulim|Batang|Dotum|PingFang|Hiragino|Heiti|Songti|"
+    r"Apple SD Gothic|AppleGothic|Nanum|Noto (Sans|Serif) (SC|TC|HK|JP|KR)\b|Sarasa|LXGW|IPA(ex)?(Gothic|Mincho)|"
+    r"Takao|Baekmuk|UnDotum", re.I)
+
+
+@cache
+def cjk_font_installed() -> bool:
+    """True if some installed font covers CJK.
+
+    Without one a PDF would show boxes, so CJK documents go as EPUB instead: the tablet
+    renders EPUB with its own fonts.
     """
-    import re
-    import shutil
-    import subprocess
+    try:
+        import typst
 
-    if not re.search(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", text) or not shutil.which("fc-list"):
-        return False
-    out = subprocess.run(["fc-list", ":lang=zh", "family"], capture_output=True, text=True).stdout
-    return not out.strip()
+        return any(CJK_FONTS.search(f) for f in typst.Fonts().families())
+    except ImportError:
+        if not shutil.which("fc-list"):
+            return True  # can't tell; Windows and macOS ship CJK fonts
+        import subprocess
+
+        return bool(subprocess.run(["fc-list", ":lang=zh", "family"], capture_output=True, text=True).stdout.strip())
 
 
-def convert(src: Path, target: str, title: str, outdir: Path) -> Path:
-    """Convert a document to PDF or EPUB for the tablet, falling back down the ranking."""
-    ext = src.suffix.lower()
-    if target == "original" or ext in NATIVE or ext not in CONVERTIBLE:
-        return src
+def read_doc(src: Path, fmt: str, build: Path) -> dict:
+    """Parse a document into pandoc's AST, sandboxed so the reader can't include other files
+    or fetch URLs. Images embedded in DOCX/ODT are extracted into build/media."""
     import pypandoc
 
-    fmt = CONVERTIBLE[ext]
-    meta = ["--metadata", f"title={title}"] if title else []
-    if target == "pdf" and fmt == "html" and "<style" in src.read_text(encoding="utf-8", errors="replace"):
-        # Designed HTML (with its own stylesheet): render it as-is with its own CSS.
-        try:
-            from weasyprint import HTML
+    args = ["--sandbox", "--quiet"]
+    if fmt in ("docx", "odt"):
+        args.append(f"--extract-media={build / 'media'}")
+    return json.loads(pypandoc.convert_file(str(src), "json", format=fmt, extra_args=args))
 
-            out = outdir / f"{title}.pdf"
-            HTML(string=no_attachments(ink_to_svg(src.read_text(encoding="utf-8"))), base_url=str(src.parent),
-                 url_fetcher=local_fetcher(src.parent)).write_pdf(out)
-            return out
-        except Exception as e:
-            print(f"warning: PDF rendering failed ({e}); converting instead", file=sys.stderr)
-    if target == "pdf":
-        try:
-            from weasyprint import CSS, HTML
 
-            # An HTML fragment, not pandoc's standalone template: its CSS (grey quotes,
-            # coloured code) and title block (duplicating the document's own heading)
-            # don't suit e-ink.
-            body = pypandoc.convert_file(str(src), "html5", format=fmt,
-                                         extra_args=["--syntax-highlighting=none"])
-            if needs_missing_cjk_font(body):
-                raise RuntimeError("no CJK font installed for PDF rendering")
-            html = f'<!doctype html><html><head><meta charset="utf-8"><title>{escape(title)}</title></head><body>{no_attachments(body)}</body></html>'
-            out = outdir / f"{title}.pdf"
-            HTML(string=html, base_url=str(src.parent), url_fetcher=local_fetcher(src.parent)).write_pdf(
-                out, stylesheets=[CSS(string=EINK_CSS)])
-            return out
-        except Exception as e:  # e.g. weasyprint's system libraries (pango) missing
-            print(f"warning: PDF conversion failed ({e}); sending EPUB instead", file=sys.stderr)
+def write_doc(ast: dict, to: str, *args: str, outputfile: Path | None = None) -> str:
+    import pypandoc
+
+    return pypandoc.convert_text(json.dumps(ast), to, format="json", extra_args=["--quiet", *args],
+                                 outputfile=str(outputfile) if outputfile else None)
+
+
+TYPST_IMAGES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+_DROP = object()
+
+
+def sanitize(ast: dict, roots: list[Path], build: Path) -> dict:
+    """Make a document safe and self-contained to render and upload.
+
+    Images under `roots` (the document's folder, extracted media) are copied into `build`,
+    as PNG if Typst can't read their format, and data: images are decoded. Any other image
+    (remote, missing, hidden or outside) becomes its alt text: nothing is fetched, no other
+    local file ends up in the upload, and one bad image can't fail the whole document.
+    Raw HTML/Typst/LaTeX is dropped (pandoc's EPUB writer would embed files that raw
+    <img> tags point to), and code languages too (syntax colours dither on e-ink).
+    """
+    import base64
+    from urllib.parse import unquote, urlparse
+    from urllib.request import url2pathname
+
+    from PIL import Image
+
+    roots = [r.resolve() for r in roots]
+    count = 0
+
+    def image(url: str) -> str | None:
+        nonlocal count
+        count += 1
+        name = f"image{count}"
+        try:
+            if url.startswith("data:"):
+                m = re.match(r"data:image/(png|jpe?g|gif|webp|svg\+xml);base64,(.*)$", url, re.S | re.I)
+                if not m:
+                    return None
+                ext = {"svg+xml": ".svg", "jpeg": ".jpg"}.get(m.group(1).lower(), "." + m.group(1).lower())
+                path = build / (name + "-data" + ext)
+                path.write_bytes(base64.b64decode(m.group(2)))
+            elif re.match(r"[A-Za-z]:[\\/]", url):  # a Windows path, not a URL scheme
+                path = Path(url)
+            else:
+                u = urlparse(url)
+                if u.scheme not in ("", "file") or u.netloc:
+                    return None
+                path = Path(url2pathname(u.path) if u.scheme == "file" else unquote(u.path))
+            if not path.is_absolute():
+                path = roots[0] / path
+            if not any(allowed_file(r, path) for r in roots + [build.resolve()]):
+                return None
+            ext = path.suffix.lower()
+            if ext in TYPST_IMAGES:
+                if ext != ".svg":
+                    with Image.open(path) as im:  # a corrupt image would fail the whole document
+                        im.verify()
+                shutil.copyfile(path, build / (name + ext))
+                return name + ext
+            with Image.open(path) as im:  # e.g. BMP or TIFF
+                im.save(build / f"{name}.png")
+            return f"{name}.png"
+        except Exception:
+            return None
+
+    def walk(x):
+        if isinstance(x, list):
+            return [y for y in map(walk, x) if y is not _DROP]
+        if not isinstance(x, dict) or "t" not in x:
+            return x
+        t, c = x["t"], x.get("c")
+        if t in ("RawBlock", "RawInline"):
+            return _DROP
+        if t in ("CodeBlock", "Code"):
+            c[0][1] = []
+        if t == "Image":
+            src = image(c[2][0])
+            if src is None:
+                return {"t": "Span", "c": [["", [], []], walk(c[1])]}
+            c[2][0] = src
+        if c is not None:
+            x["c"] = walk(c)
+        return x
+
+    ast["blocks"] = walk(ast["blocks"])
+    return ast
+
+
+def typst_str(s: str) -> str:
+    return '"' + re.sub(r"[\x00-\x1f]", " ", s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def typst_pdf(ast: dict, build: Path, title: str, out: Path) -> None:
+    """Render a document with Typst. Its root is the build folder, so it can't read anything else."""
+    import warnings
+
     try:
-        out = outdir / f"{title}.epub"
-        pypandoc.convert_file(str(src), "epub3", format=fmt, outputfile=str(out), extra_args=meta)
-        return out
+        import typst
+    except ImportError:
+        raise RenderError("Typst isn't available on this platform") from None
+    main = build / "main.typ"
+    main.write_text(f"#set document(title: {typst_str(title)})\n{TYPST_PREAMBLE}\n{write_doc(ast, 'typst')}",
+                    encoding="utf-8")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # e.g. "unknown font family" for fonts of other platforms
+            out.write_bytes(typst.compile(str(main), root=str(build)))
     except Exception as e:
-        print(f"warning: EPUB conversion failed ({e}); sending plain text", file=sys.stderr)
-        out = outdir / f"{title}.txt"
-        out.write_text(src.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-        return out
+        raise RenderError(f"Typst: {reason(e)}") from None
+
+
+def html_page(body: str, title: str) -> str:
+    return (f'<!doctype html><html><head><meta charset="utf-8"><title>{escape(title)}</title>'
+            f"<style>{EINK_CSS}</style></head><body>{body}</body></html>")
+
+
+@cache
+def weasyprint():
+    """The weasyprint module, or why it can't be used. Its install banner is kept off the output."""
+    import contextlib
+    import logging
+
+    logging.getLogger("weasyprint").setLevel(logging.ERROR)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            import weasyprint
+        return weasyprint
+    except ImportError:
+        return "WeasyPrint isn't installed on this platform"
+    except OSError:
+        return "WeasyPrint's Pango libraries aren't installed"
+
+
+def find_browser() -> str | None:
+    """An installed Chromium-based browser (Edge, Chrome, Chromium, Brave), or BOOX_BROWSER."""
+    if os.environ.get("BOOX_BROWSER"):
+        return shutil.which(os.environ["BOOX_BROWSER"])
+    found = [shutil.which(n) for n in ("msedge", "chrome", "google-chrome", "google-chrome-stable", "chromium",
+                                       "chromium-browser", "microsoft-edge", "microsoft-edge-stable", "brave-browser")]
+    if sys.platform == "win32":
+        for var in ("PROGRAMFILES(X86)", "PROGRAMFILES", "LOCALAPPDATA"):
+            if base := os.environ.get(var):
+                found += [str(Path(base, p)) for p in (r"Microsoft\Edge\Application\msedge.exe",
+                          r"Google\Chrome\Application\chrome.exe", r"Chromium\Application\chrome.exe",
+                          r"BraveSoftware\Brave-Browser\Application\brave.exe")]
+    elif sys.platform == "darwin":
+        for apps in ("/Applications", str(Path.home() / "Applications")):
+            found += [f"{apps}/{a}.app/Contents/MacOS/{a}" for a in ("Google Chrome", "Microsoft Edge", "Chromium",
+                                                                     "Brave Browser")]
+
+    def usable(p: str) -> bool:
+        # Snap browsers (Ubuntu's chromium) have a private /tmp, so they can't write the PDF where we look.
+        if not Path(p).is_file() or "/snap/" in p or os.path.realpath(p).endswith("/snap"):
+            return False
+        with open(p, "rb") as f:
+            head = f.read(4096)
+        return not (head.startswith(b"#!") and b"snap" in head)  # a wrapper script that runs the snap
+
+    return next((p for p in found if p and usable(p)), None)
+
+
+def browser_pdf(html: str, base: Path, out: Path) -> None:
+    """Print HTML to PDF with a headless Chromium-based browser, offline and sandboxed.
+
+    The page comes from a throwaway localhost server that only serves non-hidden files under
+    its folder, and every response carries a CSP that blocks scripts, frames and every other
+    origin, so the page can't read other local files or reach the network.
+    """
+    import secrets
+    import subprocess
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from mimetypes import guess_type
+    from urllib.parse import unquote, urlparse
+
+    exe = find_browser()
+    if not exe:
+        raise RenderError("no Chrome, Edge or Chromium found")
+    root, token = resource_root(base), secrets.token_urlsafe(16)
+    page = re.sub(r"<meta[^>]+http-equiv\s*=\s*[\"']?refresh[^>]*>", "", html, flags=re.I)
+    # WeasyPrint's default page, so both engines lay out pages alike; the page's own @page wins.
+    page = re.sub(r"^\s*(<!doctype[^>]*>)?", lambda m: m.group(0) + "<style>@page { size: A4; margin: 75px }</style>",
+                  page, count=1, flags=re.I).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            path, body, ctype = unquote(urlparse(self.path).path), None, "text/plain"
+            prefix = f"/{token}/"
+            if path == prefix:
+                body, ctype = page, "text/html; charset=utf-8"
+            elif path.startswith(prefix) and allowed_file(root, root / path[len(prefix):]):
+                f = root / path[len(prefix):]
+                body, ctype = f.read_bytes(), guess_type(f.name)[0] or "application/octet-stream"
+            self.send_response(200 if body is not None else 404)
+            for k, v in (("Content-Security-Policy", csp), ("X-Content-Type-Options", "nosniff"),
+                         ("Content-Type", ctype), ("Content-Length", str(len(body or b"")))):
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body or b"")
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    origin = f"http://127.0.0.1:{srv.server_address[1]}"
+    csp = (f"default-src 'none'; style-src 'unsafe-inline' {origin} data:; img-src {origin} data:; "
+           f"font-src {origin} data:; base-uri 'none'; form-action 'none'")
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    # A fresh profile that the browser creates itself: on Windows, a folder from mkdtemp
+    # (owner-only ACL since Python 3.13) is unusable by Edge's sandboxed processes.
+    profile = Path(tempfile.gettempdir()) / f"send2boox-{secrets.token_hex(8)}"
+    pdf, proc = profile / "page.pdf", None
+    args = [exe, "--headless", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+            "--disable-extensions", "--disable-sync", "--use-mock-keychain", "--password-store=basic",
+            f"--user-data-dir={profile}", "--no-pdf-header-footer", f"--print-to-pdf={pdf}",
+            "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1", origin + f"/{token}/"]
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        args.insert(1, "--no-sandbox")  # Chromium won't run as root otherwise (containers)
+    try:
+        proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Edge's launcher can exit before the PDF is written, so wait for a complete file.
+        deadline, exited = time.time() + 90, None
+        while time.time() < deadline:
+            if pdf.is_file() and pdf.read_bytes().rstrip().endswith(b"%%EOF"):
+                shutil.copyfile(pdf, out)
+                return
+            if proc.poll() is not None:
+                exited = exited or time.time()
+                if time.time() - exited > 10:
+                    break
+            time.sleep(0.2)
+        raise RenderError(f"{Path(exe).stem} didn't produce a PDF")
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+        srv.shutdown()
+        srv.server_close()
+        for _ in range(10):  # the browser may still be shutting down and holding files
+            shutil.rmtree(profile, ignore_errors=True)
+            if not profile.exists():
+                break
+            time.sleep(0.5)
+
+
+def html_pdf(html: str, base: Path, out: Path) -> None:
+    """Render HTML that has its own CSS to PDF.
+
+    Uses an installed Chromium-based browser when there is one (the same engine on every
+    OS), else WeasyPrint.
+    """
+    resource_root(base)
+    reasons = []
+    try:
+        return browser_pdf(html, base, out)
+    except RenderError as e:
+        reasons.append(str(e))
+    wp = weasyprint()
+    if isinstance(wp, str):
+        reasons.append(wp)
+    else:
+        try:
+            return wp.HTML(string=no_attachments(html), base_url=str(base),
+                           url_fetcher=local_fetcher(base)).write_pdf(out)
+        except Exception as e:
+            reasons.append(f"WeasyPrint: {reason(e)}")
+    raise RenderError("; ".join(reasons))
+
+
+def convert(src: Path, target: str, title: str, outdir: Path) -> tuple[Path, str | None]:
+    """Convert a document to PDF or EPUB for the tablet, falling back down the ranking.
+
+    Returns the file to send and, when it isn't in the requested format, a note saying
+    what was sent instead and why.
+    """
+    ext = src.suffix.lower()
+    if target == "original" or ext in NATIVE or ext not in CONVERTIBLE:
+        return src, None
+    fmt, reasons = CONVERTIBLE[ext], []
+
+    def failed(step: str, e: Exception) -> None:
+        reasons.append(reason(e))
+        print(f"warning: {step} failed: {reasons[-1]}", file=sys.stderr)
+
+    if target == "pdf" and fmt == "html":
+        text = src.read_text(encoding="utf-8", errors="replace")
+        if "<style" in text.lower():
+            # Designed HTML: render it as-is with its own CSS. Converting it would lose that
+            # styling, so if it can't be rendered, reflowable EPUB is the better fallback.
+            try:
+                html_pdf(ink_to_svg(text), src.parent, outdir / "document.pdf")
+                return outdir / "document.pdf", None
+            except RenderError as e:
+                failed("rendering the HTML", e)
+                target = "epub"
+    try:
+        ast = sanitize(read_doc(src, fmt, outdir), [src.parent, outdir / "media"], outdir)
+    except Exception as e:
+        failed("reading the document", e)
+        ast = None
+    if ast is not None and target == "pdf":
+        out = outdir / "document.pdf"
+        if CJK_TEXT.search(json.dumps(ast, ensure_ascii=False)) and not cjk_font_installed():
+            reasons.append("no CJK font installed")
+        else:
+            try:
+                typst_pdf(ast, outdir, title, out)
+                return out, None
+            except RenderError as e:
+                failed("Typst PDF rendering", e)
+            try:
+                html_pdf(html_page(write_doc(ast, "html5"), title), outdir, out)
+                return out, None
+            except Exception as e:
+                failed("HTML PDF rendering", e)
+    if ast is not None:
+        try:
+            out = outdir / "document.epub"
+            write_doc(ast, "epub3", f"--resource-path={outdir}", "--metadata", f"title={title}", outputfile=out)
+            return out, (f"as EPUB (PDF unavailable: {'; '.join(reasons)})" if reasons else None)
+        except Exception as e:
+            failed("EPUB conversion", e)
+    out = outdir / "document.txt"
+    out.write_text(src.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+    return out, f"as plain text ({'; '.join(reasons)})"
 
 
 def strip_ext(title: str) -> str:
@@ -386,33 +784,63 @@ def strip_ext(title: str) -> str:
 
 def send_paths(paths: list[Path], target: str, title: str | None) -> None:
     b = client()
-    with tempfile.TemporaryDirectory() as d:
-        for p in paths:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        for n, p in enumerate(paths):
             t = strip_ext(title) if title else p.stem
-            out = convert(p, target, t, Path(d))
+            work = Path(d) / str(n)  # short, fixed names: titles never become paths
+            work.mkdir()
+            out, note = convert(p, target, t, work)
             name = f"{t}{out.suffix}" if out is not p else (title or p.name)
-            print(f"Sent: {b.send_file(out, name)}")
+            sent = b.send_file(out, name)
+            print(f"Sent {note}: {sent}" if note else f"Sent: {sent}")
 
 
-def cmd_send(a):
-    paths = [Path(f).expanduser() for f in a.files]
+def check_files(paths: list[Path]) -> None:
     for p in paths:
         if not p.is_file():
             sys.exit(f"error: no such file: {p}")
         if p.stat().st_size == 0:
             sys.exit(f"error: empty file: {p}")
+
+
+def cmd_send(a):
+    paths = [Path(f).expanduser() for f in a.files]
+    check_files(paths)
     if a.title and len(paths) > 1:
         sys.exit("error: --title only works when sending a single file")
     send_paths(paths, a.as_, a.title)
 
 
+def read_stdin() -> str:
+    """Piped text, decoded as UTF-8 whatever the console's code page (Windows pipes default to it)."""
+    import codecs
+    import locale
+
+    data = sys.stdin.buffer.read()
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode(locale.getpreferredencoding(False), errors="replace")
+
+
 def cmd_send_text(a):
-    text = sys.stdin.read() if a.text in (None, "-") else a.text
+    if a.file:
+        if a.text is not None:
+            sys.exit("error: give the text or --file, not both")
+        p = Path(a.file).expanduser()
+        check_files([p])
+        if CONVERTIBLE.get(p.suffix.lower()) not in ("markdown", "html"):
+            sys.exit("error: --file takes Markdown, HTML or text (.md, .html, .txt)")
+        send_paths([p], a.as_, a.title)
+        return
+    text = read_stdin() if a.text in (None, "-") else a.text
     if not text.strip():
         sys.exit("error: no text given")
     title = strip_ext(a.title or "Note")
-    with tempfile.TemporaryDirectory() as d:
-        p = Path(d) / f"{title}.{a.format}"
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        p = Path(d) / f"input.{a.format}"
         p.write_text(text, encoding="utf-8")
         send_paths([p], a.as_, title)
 
@@ -532,12 +960,10 @@ class Notebook:
 
     @cached_property
     def objects(self) -> list:
-        import oss2
-
-        return sorted(oss2.ObjectIterator(self.b.bucket, prefix=self.prefix + "/"), key=lambda o: o.last_modified)
+        return sorted(self.b.storage.list(self.prefix + "/"), key=lambda o: o.last_modified)
 
     def read(self, key: str) -> bytes:
-        return self.b.bucket.get_object(key).read()
+        return self.b.storage.get(key)
 
     def _shape_status(self, key: str, status: dict[str, int]) -> None:
         import zipfile
@@ -675,8 +1101,8 @@ class Notebook:
         zbuf = io.BytesIO()
         with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr(entry, bytes(shapes))
-        self.b.bucket.put_object(f"{self.prefix}/point/{pid}#{pts_rev}#points", bytes(body))
-        self.b.bucket.put_object(f"{self.prefix}/shape/{entry}.zip", zbuf.getvalue())
+        self.b.storage.put(f"{self.prefix}/point/{pid}#{pts_rev}#points", bytes(body))
+        self.b.storage.put(f"{self.prefix}/shape/{entry}.zip", zbuf.getvalue())
 
         # Mark the page changed, as the tablet does after an edit, so it pulls the new ink.
         s, db = self.b.sync
@@ -692,9 +1118,11 @@ class Notebook:
 
 
 def safe_name(name: str) -> str:
-    import re
-
-    return re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or "notebook"
+    """A file name that's valid on Windows, macOS and Linux."""
+    name = re.sub(r'[\x00-\x1f\\/:*?"<>|]+', "_", name).strip()[:100].rstrip(". ")
+    if re.fullmatch(r"(con|prn|aux|nul|com\d|lpt\d)(\..*)?", name, re.I):  # reserved on Windows
+        name = "_" + name
+    return name or "notebook"
 
 
 def notebooks(b: "Boox") -> list[Notebook]:
@@ -767,7 +1195,7 @@ def cmd_ink(a):
 
 def cmd_write(a):
     """Write text onto a notebook page as real, erasable pen strokes."""
-    text = (sys.stdin.read() if a.text in (None, "-") else a.text).strip()
+    text = (read_stdin() if a.text in (None, "-") else a.text).strip()
     if not text:
         sys.exit("error: no text given")
     if not (0 <= a.x < 1 and 0 <= a.y < 1 and 0 < a.size < 0.5 and (a.width is None or 0 < a.width <= 1)):
@@ -827,13 +1255,14 @@ def screen_image(src: Path, out: Path, screen: tuple[int, int] = SCREEN) -> Path
         import pypdfium2
 
         if ext == ".pdf":
-            pdf = pypdfium2.PdfDocument(str(src))
+            pdf = pypdfium2.PdfDocument(src.read_bytes())
         else:
-            from weasyprint import HTML
-
-            html = no_attachments(ink_to_svg(src.read_text(encoding="utf-8")))
-            pdf = pypdfium2.PdfDocument(HTML(string=html, base_url=str(src.parent),
-                                             url_fetcher=local_fetcher(src.parent)).write_pdf())
+            rendered = out.with_name("page.pdf")
+            try:
+                html_pdf(ink_to_svg(src.read_text(encoding="utf-8")), src.parent, rendered)
+            except RenderError as e:
+                sys.exit(f"error: can't render the HTML: {e}. See `send2boox.py doctor`, or pass a PNG or PDF")
+            pdf = pypdfium2.PdfDocument(rendered.read_bytes())
         page = pdf[0]
         img = page.render(scale=screen[0] / page.get_width()).to_pil()
     else:
@@ -847,15 +1276,14 @@ def screen_image(src: Path, out: Path, screen: tuple[int, int] = SCREEN) -> Path
 def push_screensaver(b: Boox, png: Path, name: str) -> None:
     """Upload a screensaver the way push.boox.com does and push it to the tablet."""
     import hashlib
-    import oss2
     import time
 
     key = f"{b.uid}/push/{uuid.uuid4()}.png"
-    oss2.resumable_upload(b.bucket, key, str(png))
+    b.storage.upload(key, png)
     data = png.read_bytes()
     now = int(time.time() * 1000)
     guid = str(uuid.uuid4())
-    url = b.bucket.sign_url("GET", key, 10000, params={"response-content-disposition": "attachment"})
+    url = b.storage.sign_url(key, 10000)
     content = {"_id": guid, "createdAt": now, "distributeChannel": "onyx", "formats": ["png"], "guid": guid,
                "name": name, "ownerId": b.uid, "size": len(data), "md5": hashlib.md5(data).hexdigest(),
                "storage": {"png": {"oss": {"displayName": name, "expires": 0, "key": key, "provider": "oss",
@@ -873,7 +1301,7 @@ def push_screensaver(b: Boox, png: Path, name: str) -> None:
     if not result.get("rev"):
         sys.exit(f"error: couldn't create the screensaver record: {r.text[:200] if r is not None else 'timeout'}")
     b.call("screenSavers/push", timeout=120, data={
-        "data": {"name": name, "resourceDisplayName": name, "resourceKey": key, "bucket": b.bucket.bucket_name,
+        "data": {"name": name, "resourceDisplayName": name, "resourceKey": key, "bucket": b.storage.bucket,
                  "resourceType": "png", "title": name, "parent": None},
         "cbMsg": {"id": guid, "rev": result["rev"]}})
 
@@ -889,7 +1317,7 @@ def cmd_screensaver(a):
     except (ValueError, AssertionError):
         sys.exit("error: --screen must look like 2400x3200 (each side at most 10000)")
     with tempfile.TemporaryDirectory() as d:
-        png = screen_image(src, Path(d) / name, screen)
+        png = screen_image(src, Path(d) / "screen.png", screen)
         if a.preview:
             out = Path(a.preview).expanduser()
             out.write_bytes(png.read_bytes())
@@ -904,7 +1332,46 @@ def cmd_delete(a):
     print(f"Deleted {len(a.ids)} file(s)")
 
 
+def cmd_doctor(a):
+    """Show which renderers this machine has, and what each kind of conversion will use."""
+    import platform
+    from importlib.metadata import version
+
+    def check(fn):
+        try:
+            return True, fn()
+        except Exception as e:
+            return False, reason(e)
+
+    def pandoc():
+        import pypandoc
+
+        return f"pandoc {pypandoc.get_pandoc_version()}"
+
+    def typst():
+        import typst  # noqa: F401
+
+        return f"typst {version('typst')}"
+
+    has_pandoc, pandoc_info = check(pandoc)
+    has_typst, typst_info = check(typst)
+    browser, wp = find_browser(), weasyprint()
+    html_engine = browser or (None if isinstance(wp, str) else "WeasyPrint")
+    docs = ("Typst" if has_typst else html_engine) if has_pandoc else None
+    print(f"Python {platform.python_version()} on {platform.system()} {platform.machine()}")
+    print(f"pandoc:     {pandoc_info}")
+    print(f"Typst:      {typst_info}")
+    print(f"browser:    {browser or 'none found (install Chrome, Edge or Chromium, or set BOOX_BROWSER)'}")
+    print(f"WeasyPrint: {wp if isinstance(wp, str) else 'available'}")
+    print(f"CJK fonts:  {'yes' if cjk_font_installed() else 'none, so CJK documents are sent as EPUB'}")
+    print(f"login:      {'saved' if load_config().get('token') else 'not logged in'}")
+    print(f"Markdown and documents -> PDF:        {docs or 'unavailable (sent as EPUB or text)'}")
+    print(f"designed HTML and HTML sleep screens: {html_engine or 'unavailable (use a PNG or PDF)'}")
+
+
 def main():
+    for stream in (sys.stdout, sys.stderr):  # pipes on Windows default to the ANSI code page
+        stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(required=True)
     s = sub.add_parser("login-request", help="email a 6-digit login code")
@@ -915,14 +1382,16 @@ def main():
     s.add_argument("code")
     s.set_defaults(fn=cmd_login)
     sub.add_parser("status", help="check the saved login").set_defaults(fn=cmd_status)
+    sub.add_parser("doctor", help="show which renderers this machine has").set_defaults(fn=cmd_doctor)
     s = sub.add_parser("send", help="send one or more files")
     s.add_argument("files", nargs="+")
     s.add_argument("--title", help="display name on the tablet (single file only)")
     s.add_argument("--as", dest="as_", default="original", choices=["original", "pdf", "epub"],
                    help="send unchanged (default), or convert Markdown/HTML/DOCX/etc. to PDF or EPUB")
     s.set_defaults(fn=cmd_send)
-    s = sub.add_parser("send-text", help="send text (argument or stdin) as a document")
+    s = sub.add_parser("send-text", help="send text (argument, stdin or --file) as a document")
     s.add_argument("text", nargs="?")
+    s.add_argument("--file", help="read the text from a Markdown, HTML or text file (best on Windows)")
     s.add_argument("--title", help="document name, e.g. 'Meeting notes'")
     s.add_argument("--format", default="md", choices=["md", "html", "txt"], help="format of the input text (default md)")
     s.add_argument("--as", dest="as_", default="pdf", choices=["pdf", "epub", "original"],
