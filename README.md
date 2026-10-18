@@ -38,11 +38,14 @@ Lets your agent work with a [BOOX](https://www.boox.com/) e-ink tablet over the 
 - **Manage:** list and delete sent files.
 
 **Requirements**
-- [uv](https://docs.astral.sh/uv/), which installs the Python dependencies automatically.
-- Pango, for PDF rendering via WeasyPrint. It's preinstalled on most Linux desktops; on macOS run `brew install pango`. Without it, documents are sent as EPUB instead.
-- For CJK text in PDFs, a CJK font such as Noto Sans CJK. Without one, EPUB is used.
+- [uv](https://docs.astral.sh/uv/), which installs Python and every dependency automatically. That's all: it works on Windows, macOS and Linux (including WSL) in Bash or PowerShell.
 
-HTML is rendered offline: it can use images and fonts from its own folder, but remote resources are not loaded.
+Documents (Markdown, text, DOCX, ODT, RST, Org, LaTeX) are converted with pandoc and rendered to PDF with [Typst](https://typst.app), both bundled. Notes:
+- HTML with its own CSS (designed pages, HTML sleep screens) is rendered by an installed Chrome, Edge or Chromium (Edge comes with Windows), or by WeasyPrint where Pango is installed. It's rendered offline and without scripts, and can only use images and fonts from its own folder.
+- CJK text needs a CJK font, which Windows and macOS include. On Linux, install one such as Noto Sans CJK; without it, CJK documents are sent as EPUB.
+- Not supported: Alpine/musl Linux, where Typst has no prebuilt package. On Windows on ARM, documents need a [pandoc](https://pandoc.org/installing.html) install and are rendered with Edge.
+
+Run `send2boox.py doctor` to see what a machine will use.
 
 **Sign in** by asking your agent to log in to your Boox, or run:
 ```
