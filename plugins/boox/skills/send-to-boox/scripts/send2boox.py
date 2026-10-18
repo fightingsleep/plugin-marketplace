@@ -42,7 +42,7 @@ import sys
 import tempfile
 import uuid
 from functools import cache, cached_property
-from html import escape
+from html import escape, unescape
 from pathlib import Path
 
 import requests
@@ -456,6 +456,7 @@ def write_doc(ast: dict, to: str, *args: str, outputfile: Path | None = None) ->
 
 
 TYPST_IMAGES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+SAFE_META = {"title", "subtitle", "author", "date", "lang", "abstract", "description", "subject", "keywords"}
 _DROP = object()
 
 
@@ -475,7 +476,14 @@ def sanitize(ast: dict, roots: list[Path], build: Path) -> dict:
 
     from PIL import Image
 
-    roots = [r.resolve() for r in roots]
+    def usable_root(r: Path) -> Path | None:
+        try:
+            return resource_root(r)
+        except RenderError:  # a home folder or drive root: don't embed images from all of it
+            return None
+
+    base = roots[0].resolve()
+    roots = [r for r in map(usable_root, roots) if r] + [build.resolve()]
     count = 0
 
     def image(url: str) -> str | None:
@@ -498,12 +506,16 @@ def sanitize(ast: dict, roots: list[Path], build: Path) -> dict:
                     return None
                 path = Path(url2pathname(u.path) if u.scheme == "file" else unquote(u.path))
             if not path.is_absolute():
-                path = roots[0] / path
-            if not any(allowed_file(r, path) for r in roots + [build.resolve()]):
+                path = base / path
+            if not any(allowed_file(r, path) for r in roots):
                 return None
             ext = path.suffix.lower()
             if ext in TYPST_IMAGES:
-                if ext != ".svg":
+                if ext == ".svg":
+                    # An SVG that links other files (rather than embedding them) fails the whole document in Typst.
+                    if re.search(r"""href\s*=\s*["'](?!data:|#)""", path.read_text(encoding="utf-8", errors="replace")):
+                        return None
+                else:
                     with Image.open(path) as im:  # a corrupt image would fail the whole document
                         im.verify()
                 shutil.copyfile(path, build / (name + ext))
@@ -534,6 +546,8 @@ def sanitize(ast: dict, roots: list[Path], build: Path) -> dict:
         return x
 
     ast["blocks"] = walk(ast["blocks"])
+    # Metadata such as cover-image or css names files that pandoc's EPUB writer embeds.
+    ast["meta"] = {k: walk(v) for k, v in ast.get("meta", {}).items() if k in SAFE_META}
     return ast
 
 
@@ -605,7 +619,7 @@ def find_browser() -> str | None:
             return False
         with open(p, "rb") as f:
             head = f.read(4096)
-        return not (head.startswith(b"#!") and b"snap" in head)  # a wrapper script that runs the snap
+        return not (head.startswith(b"#!") and b"/snap/" in head)  # a wrapper script that runs the snap
 
     return next((p for p in found if p and usable(p)), None)
 
@@ -627,9 +641,14 @@ def browser_pdf(html: str, base: Path, out: Path) -> None:
 
     exe = find_browser()
     if not exe:
+        if os.environ.get("BOOX_BROWSER"):
+            raise RenderError(f"BOOX_BROWSER ({os.environ['BOOX_BROWSER']}) isn't an executable")
         raise RenderError("no Chrome, Edge or Chromium found")
     root, token = resource_root(base), secrets.token_urlsafe(16)
-    page = re.sub(r"<meta[^>]+http-equiv\s*=\s*[\"']?refresh[^>]*>", "", html, flags=re.I)
+    # Drop <meta http-equiv> (refresh would navigate away; CSP doesn't stop that). Entities are
+    # decoded first, since browsers decode them in attribute values.
+    page = re.sub(r"<meta\b[^>]*>", lambda m: "" if "http-equiv" in unescape(m.group(0)).lower() else m.group(0),
+                  html, flags=re.I)
     # WeasyPrint's default page, so both engines lay out pages alike; the page's own @page wins.
     page = re.sub(r"^\s*(<!doctype[^>]*>)?", lambda m: m.group(0) + "<style>@page { size: A4; margin: 75px }</style>",
                   page, count=1, flags=re.I).encode()
@@ -665,17 +684,27 @@ def browser_pdf(html: str, base: Path, out: Path) -> None:
     args = [exe, "--headless", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
             "--disable-extensions", "--disable-sync", "--use-mock-keychain", "--password-store=basic",
             f"--user-data-dir={profile}", "--no-pdf-header-footer", f"--print-to-pdf={pdf}",
-            "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1", origin + f"/{token}/"]
+            # No network: names don't resolve, and anything else goes to a dead proxy
+            # (loopback, where the page is served, always bypasses proxies).
+            "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1", "--proxy-server=127.0.0.1:9",
+            origin + f"/{token}/"]
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         args.insert(1, "--no-sandbox")  # Chromium won't run as root otherwise (containers)
     try:
-        proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+        except OSError as e:
+            raise RenderError(f"couldn't start {Path(exe).stem}: {reason(e)}") from None
         # Edge's launcher can exit before the PDF is written, so wait for a complete file.
         deadline, exited = time.time() + 90, None
         while time.time() < deadline:
-            if pdf.is_file() and pdf.read_bytes().rstrip().endswith(b"%%EOF"):
-                shutil.copyfile(pdf, out)
-                return
+            try:
+                if pdf.is_file() and pdf.read_bytes().rstrip().endswith(b"%%EOF"):
+                    shutil.copyfile(pdf, out)
+                    return
+            except OSError:  # still being written (Windows locks it)
+                pass
             if proc.poll() is not None:
                 exited = exited or time.time()
                 if time.time() - exited > 10:
@@ -1316,7 +1345,7 @@ def cmd_screensaver(a):
         assert len(screen) == 2 and 0 < min(screen) and max(screen) <= 10000
     except (ValueError, AssertionError):
         sys.exit("error: --screen must look like 2400x3200 (each side at most 10000)")
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
         png = screen_image(src, Path(d) / "screen.png", screen)
         if a.preview:
             out = Path(a.preview).expanduser()
